@@ -203,8 +203,10 @@ func (s *MCPServer) validateStandardHeadersForMessage(
 	if !needsName && method != mcp.MethodToolsCall {
 		return mcp.ValidateStandardHeaders(headers.Get, protocolVersion, method, nil)
 	}
-	if method == mcp.MethodToolsCall && s.headerNamesBoundTool(ctx, headers) {
-		return s.validateStandardHeadersWithParams(ctx, headers, protocolVersion, method, message)
+	if method == mcp.MethodToolsCall && needsName {
+		if bindings := s.headerNamedToolBindings(ctx, headers); len(bindings) > 0 {
+			return s.validateBoundToolHeaders(headers, protocolVersion, message, bindings)
+		}
 	}
 
 	var probe struct {
@@ -282,17 +284,37 @@ func (s *MCPServer) validateStandardHeadersWithParams(
 	return mcp.ValidateParamHeadersWithBindings(lookupHeader(headers), bindings, wrapper.Params)
 }
 
-// headerNamesBoundTool reports whether the tool named in the Mcp-Name header
-// binds parameters to headers. Validation then needs params whole, which one
-// pass over the message provides. The header must match the body name for
-// validation to pass, so the choice never changes the result.
-func (s *MCPServer) headerNamesBoundTool(ctx context.Context, headers http.Header) bool {
+// headerNamedToolBindings returns the header bindings of the tool named in
+// the Mcp-Name header, or nil when it names none or the tool binds nothing.
+func (s *MCPServer) headerNamedToolBindings(ctx context.Context, headers http.Header) []mcp.ParamHeaderBinding {
 	name, ok := mcp.DecodeHeaderValue(headers.Get(mcp.HeaderName))
 	if !ok || name == "" {
-		return false
+		return nil
 	}
-	bindings, ok := s.headerBindingsForCall(ctx, name)
-	return ok && len(bindings) > 0
+	bindings, _ := s.headerBindingsForCall(ctx, name)
+	return bindings
+}
+
+// validateBoundToolHeaders validates a tools/call for a tool that binds
+// parameters to headers, reading params whole in a single pass. The bindings
+// come from the Mcp-Name header, which ValidateStandardHeaders requires to
+// match the body name before they are used.
+func (s *MCPServer) validateBoundToolHeaders(
+	headers http.Header,
+	protocolVersion string,
+	message json.RawMessage,
+	bindings []mcp.ParamHeaderBinding,
+) error {
+	var wrapper struct {
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(message, &wrapper); err != nil {
+		return nil
+	}
+	if err := mcp.ValidateStandardHeaders(headers.Get, protocolVersion, mcp.MethodToolsCall, wrapper.Params); err != nil {
+		return err
+	}
+	return mcp.ValidateParamHeadersWithBindings(lookupHeader(headers), bindings, wrapper.Params)
 }
 
 // headerFields holds the members of params that header validation reads.
