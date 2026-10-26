@@ -754,6 +754,11 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 // ToolArgumentsSchema represents a JSON Schema for tool arguments.
 type ToolArgumentsSchema struct {
 	Defs map[string]any `json:"$defs,omitempty"`
+	// Definitions holds the draft-07 and earlier "definitions" container. It is
+	// kept as written when the schema declares its dialect with $schema or
+	// also has "$defs"; an undeclared schema with only "definitions" is
+	// decoded into Defs instead, with its local references rewritten.
+	Definitions map[string]any `json:"-"`
 	Type string         `json:"type"`
 	// Types holds an array-valued JSON Schema type, including a single-element
 	// array. Type remains a string for compatibility and takes precedence when
@@ -836,6 +841,9 @@ func toolArgumentsSchemaMarshalJSON(tis ToolArgumentsSchema) ([]byte, error) {
 	if tis.Defs != nil {
 		m["$defs"] = tis.Defs
 	}
+	if tis.Definitions != nil {
+		m["definitions"] = tis.Definitions
+	}
 
 	// Marshal Properties to '{}' rather than `nil` when its length equals zero
 	switch {
@@ -851,10 +859,11 @@ func toolArgumentsSchemaMarshalJSON(tis ToolArgumentsSchema) ([]byte, error) {
 		m["properties"] = map[string]any{}
 	}
 
-	// Marshal Required to '[]' rather than `nil` when its length equals zero
+	// Marshal Required to '[]' rather than `nil` when its length equals zero,
+	// except for draft-04 and earlier, where an empty array is invalid.
 	if len(tis.Required) > 0 {
 		m["required"] = tis.Required
-	} else {
+	} else if !forbidsEmptyRequired(tis.AdditionalFields) {
 		m["required"] = []string{}
 	}
 
@@ -995,7 +1004,9 @@ func toolArgumentsSchemaUnmarshalJSON(data []byte, tis *ToolArgumentsSchema) err
 	}
 
 	var additionalFields map[string]any
-	if err := json.Unmarshal(data, &additionalFields); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&additionalFields); err != nil {
 		return err
 	}
 	for key := range additionalFields {
@@ -1007,16 +1018,21 @@ func toolArgumentsSchemaUnmarshalJSON(data []byte, tis *ToolArgumentsSchema) err
 		additionalFields = nil
 	}
 
-	// If $defs wasn't provided but definitions was, use definitions.
-	// Marshaling re-emits Defs as "$defs", so local "#/definitions/..." $ref
-	// pointers must be rewritten to "#/$defs/..." or the round-tripped schema
-	// carries dangling references that strict validators reject.
-	if tis.Defs == nil && aux.Definitions != nil {
-		tis.Defs = aux.Definitions
-		rewriteDraft07LocalRefs(tis.Defs)
-		rewriteDraft07LocalRefs(tis.Properties)
-		rewriteDraft07LocalRefs(tis.AdditionalProperties)
-		rewriteDraft07LocalRefs(additionalFields)
+	// An undeclared schema with only "definitions" is normalized to "$defs".
+	// Local "#/definitions/..." $ref pointers are rewritten to "#/$defs/..."
+	// so the round-tripped schema carries no dangling references. A schema
+	// that declares its dialect, or has both containers, keeps them as written.
+	tis.Definitions = nil
+	if aux.Definitions != nil {
+		if tis.Defs == nil && !declaresDialect(additionalFields) {
+			tis.Defs = aux.Definitions
+			rewriteDraft07SchemaMap(tis.Defs)
+			rewriteDraft07SchemaMap(tis.Properties)
+			rewriteDraft07LocalRefs(tis.AdditionalProperties)
+			rewriteDraft07LocalRefs(additionalFields)
+		} else {
+			tis.Definitions = aux.Definitions
+		}
 	}
 
 	tis.AdditionalFields = additionalFields
@@ -1024,23 +1040,69 @@ func toolArgumentsSchemaUnmarshalJSON(data []byte, tis *ToolArgumentsSchema) err
 }
 
 // rewriteDraft07LocalRefs rewrites local draft-07 "#/definitions/..." $ref
-// pointers to their 2019-09+ "#/$defs/..." equivalent in place. It walks
-// nested maps and slices; non-local refs are left untouched.
+// pointers to their 2019-09+ "#/$defs/..." equivalent in place. node is a
+// schema object; only keywords whose values are schemas are followed, so
+// instance data such as default, examples, const, enum and vendor
+// extensions is left untouched.
 func rewriteDraft07LocalRefs(node any) {
 	const draft07Prefix = "#/definitions/"
-	switch v := node.(type) {
-	case map[string]any:
-		if ref, ok := v["$ref"].(string); ok && strings.HasPrefix(ref, draft07Prefix) {
-			v["$ref"] = "#/$defs/" + ref[len(draft07Prefix):]
-		}
-		for _, child := range v {
+	schema, ok := node.(map[string]any)
+	if !ok {
+		return
+	}
+	if ref, ok := schema["$ref"].(string); ok && strings.HasPrefix(ref, draft07Prefix) {
+		schema["$ref"] = "#/$defs/" + ref[len(draft07Prefix):]
+	}
+	for key, child := range schema {
+		switch key {
+		case "properties", "patternProperties", "$defs", "definitions", "dependentSchemas":
+			if schemas, ok := child.(map[string]any); ok {
+				rewriteDraft07SchemaMap(schemas)
+			}
+		case "items", "prefixItems", "allOf", "anyOf", "oneOf":
+			rewriteDraft07SchemaList(child)
+		case "additionalProperties", "additionalItems", "unevaluatedProperties", "unevaluatedItems",
+			"contains", "propertyNames", "if", "then", "else", "not", "contentSchema":
 			rewriteDraft07LocalRefs(child)
-		}
-	case []any:
-		for _, child := range v {
-			rewriteDraft07LocalRefs(child)
+		case "dependencies":
+			if deps, ok := child.(map[string]any); ok {
+				rewriteDraft07SchemaMap(deps)
+			}
 		}
 	}
+}
+
+// rewriteDraft07SchemaMap applies rewriteDraft07LocalRefs to every schema in
+// a keyword whose value maps names to schemas.
+func rewriteDraft07SchemaMap(schemas map[string]any) {
+	for _, schema := range schemas {
+		rewriteDraft07LocalRefs(schema)
+	}
+}
+
+// rewriteDraft07SchemaList applies rewriteDraft07LocalRefs to a keyword whose
+// value is a schema or an array of schemas.
+func rewriteDraft07SchemaList(node any) {
+	if list, ok := node.([]any); ok {
+		for _, schema := range list {
+			rewriteDraft07LocalRefs(schema)
+		}
+		return
+	}
+	rewriteDraft07LocalRefs(node)
+}
+
+// declaresDialect reports whether the schema names its dialect with $schema.
+func declaresDialect(fields map[string]any) bool {
+	_, ok := fields["$schema"].(string)
+	return ok
+}
+
+// forbidsEmptyRequired reports whether the schema declares draft-03 or
+// draft-04, where "required" may not be an empty array.
+func forbidsEmptyRequired(fields map[string]any) bool {
+	dialect, _ := fields["$schema"].(string)
+	return strings.Contains(dialect, "draft-03") || strings.Contains(dialect, "draft-04")
 }
 
 type ToolAnnotation struct {
