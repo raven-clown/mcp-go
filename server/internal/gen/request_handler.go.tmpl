@@ -22,20 +22,31 @@ func (s *MCPServer) HandleMessage(
 	var err *requestError
 
 	var baseMessage struct {
-		JSONRPC string      `json:"jsonrpc"`
-		Method  mcp.MCPMethod `json:"method"`
-		ID      any           `json:"id,omitempty"`
-		Result  any           `json:"result,omitempty"`
+		JSONRPC string          `json:"jsonrpc"`
+		Method  mcp.MCPMethod   `json:"method"`
+		RawID   json.RawMessage `json:"id,omitempty"`
+		Result  json.RawMessage `json:"result,omitempty"`
+		ID      any             `json:"-"`
 	}
 
-	decoder := json.NewDecoder(bytes.NewReader(message))
-	decoder.UseNumber()
-	if err := decoder.Decode(&baseMessage); err != nil || !json.Valid(message) {
+	if err := json.Unmarshal(message, &baseMessage); err != nil {
 		return createErrorResponse(
 			nil,
 			mcp.PARSE_ERROR,
 			"Failed to parse message",
 		)
+	}
+
+	if len(baseMessage.RawID) > 0 {
+		decoder := json.NewDecoder(bytes.NewReader(baseMessage.RawID))
+		decoder.UseNumber()
+		if err := decoder.Decode(&baseMessage.ID); err != nil {
+			return createErrorResponse(
+				nil,
+				mcp.PARSE_ERROR,
+				"Failed to parse message",
+			)
+		}
 	}
 
 	if number, ok := baseMessage.ID.(json.Number); ok {
@@ -71,7 +82,7 @@ func (s *MCPServer) HandleMessage(
 		return nil // Return nil for notifications
 	}
 
-	if baseMessage.Result != nil {
+	if len(baseMessage.Result) > 0 && !bytes.Equal(baseMessage.Result, []byte("null")) {
 		// this is a response to a request sent by the server (e.g. from a ping
 		// sent due to WithKeepAlive option)
 		return nil
