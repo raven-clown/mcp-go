@@ -30,7 +30,7 @@ func BenchmarkDispatchToolCall(b *testing.B) {
 	for _, size := range []int{16, 64 << 10, 1 << 20} {
 		s := benchServer()
 		msg := callMsg(size)
-		ctx := context.Background()
+		ctx := b.Context()
 		b.Run(fmt.Sprintf("args=%d", size), func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(msg)))
@@ -47,7 +47,7 @@ func BenchmarkDispatchClientResponse(b *testing.B) {
 	for _, size := range []int{16, 64 << 10, 1 << 20} {
 		s := benchServer()
 		msg := respMsg(size)
-		ctx := context.Background()
+		ctx := b.Context()
 		b.Run(fmt.Sprintf("result=%d", size), func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(msg)))

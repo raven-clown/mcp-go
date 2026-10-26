@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 
@@ -35,7 +34,7 @@ func TestHandleMessage_ParsesEnvelope(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := NewMCPServer("test", "1.0.0")
-			resp := s.HandleMessage(context.Background(), json.RawMessage(tt.message))
+			resp := s.HandleMessage(t.Context(), json.RawMessage(tt.message))
 
 			if tt.wantNil {
 				assert.Nil(t, resp)

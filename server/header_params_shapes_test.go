@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -79,7 +78,7 @@ func TestValidateStandardHeaders_ParamsShapes(t *testing.T) {
 			}
 
 			err := benchServer().validateStandardHeadersForMessage(
-				context.Background(), h, mcp.ProtocolVersion20260728, mcp.MCPMethod(tt.method), json.RawMessage(tt.body))
+				t.Context(), h, mcp.ProtocolVersion20260728, mcp.MCPMethod(tt.method), json.RawMessage(tt.body))
 
 			assert.Equal(t, tt.wantErr, fmt.Sprint(errString(err)))
 		})
