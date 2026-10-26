@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // CORSConfig holds the Cross-Origin Resource Sharing configuration shared by
@@ -27,8 +29,10 @@ type CORSConfig struct {
 
 	// AllowedHeaders is the list of headers a client may send with the
 	// actual request. When empty, a sensible MCP-aware default of
-	// Content-Type, Mcp-Session-Id, Last-Event-ID and Authorization is
-	// advertised.
+	// Content-Type, Mcp-Session-Id, Last-Event-ID, Authorization,
+	// Mcp-Protocol-Version, Mcp-Method and Mcp-Name is advertised.
+	// Mcp-Param-* headers depend on each tool's schema and must be listed
+	// explicitly.
 	AllowedHeaders []string
 
 	// ExposedHeaders is the list of response headers the browser is
@@ -67,8 +71,21 @@ func WithCORSAllowedMethods(methods ...string) CORSOption {
 	}
 }
 
+// defaultCORSAllowedHeaders is advertised when no AllowedHeaders are set.
+var defaultCORSAllowedHeaders = []string{
+	"Content-Type",
+	HeaderKeySessionID,
+	"Last-Event-ID",
+	"Authorization",
+	mcp.HeaderProtocolVersion,
+	mcp.HeaderMethod,
+	mcp.HeaderName,
+}
+
 // WithCORSAllowedHeaders sets the list of headers advertised in preflight
-// responses via Access-Control-Allow-Headers.
+// responses via Access-Control-Allow-Headers. It replaces the default list,
+// so include Mcp-Protocol-Version, Mcp-Method and Mcp-Name when clients send
+// them.
 func WithCORSAllowedHeaders(headers ...string) CORSOption {
 	return func(c *CORSConfig) {
 		c.AllowedHeaders = append(c.AllowedHeaders[:0:0], headers...)
@@ -178,7 +195,7 @@ func (c *CORSConfig) handlePreflight(w http.ResponseWriter, r *http.Request) boo
 
 	headers := c.AllowedHeaders
 	if len(headers) == 0 {
-		headers = []string{"Content-Type", HeaderKeySessionID, "Last-Event-ID", "Authorization"}
+		headers = defaultCORSAllowedHeaders
 	}
 	h.Set("Access-Control-Allow-Headers", strings.Join(headers, ", "))
 
