@@ -27,6 +27,9 @@ func TestHandleMessage_ParsesEnvelope(t *testing.T) {
 		{name: "null result is a request", message: `{"jsonrpc":"2.0","id":3,"result":null,"method":"ping"}`, wantID: float64(3)},
 		{name: "string id", message: `{"jsonrpc":"2.0","id":"abc","method":"ping"}`, wantID: "abc"},
 		{name: "large id keeps precision", message: `{"jsonrpc":"2.0","id":9007199254740993,"method":"ping"}`, wantID: int64(9007199254740993)},
+		{name: "params array is an invalid request", message: `{"jsonrpc":"2.0","id":4,"method":"ping","params":[1]}`, wantError: mcp.INVALID_REQUEST},
+		{name: "malformed _meta is an invalid request", message: `{"jsonrpc":"2.0","id":5,"method":"ping","params":{"_meta":"x"}}`, wantError: mcp.INVALID_REQUEST},
+		{name: "null params", message: `{"jsonrpc":"2.0","id":6,"method":"ping","params":null}`, wantID: float64(6)},
 	}
 
 	for _, tt := range tests {

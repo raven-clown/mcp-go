@@ -21,20 +21,32 @@ func (s *MCPServer) HandleMessage(
 	ctx = context.WithValue(ctx, serverKey{}, s)
 	var err *requestError
 
-	var baseMessage struct {
+	type envelope struct {
 		JSONRPC string          `json:"jsonrpc"`
 		Method  mcp.MCPMethod   `json:"method"`
 		RawID   json.RawMessage `json:"id,omitempty"`
 		Result  json.RawMessage `json:"result,omitempty"`
-		ID      any             `json:"-"`
+	}
+	var baseMessage struct {
+		envelope
+		Params struct {
+			Meta *mcp.Meta `json:"_meta"`
+		} `json:"params"`
+		ID any `json:"-"`
 	}
 
+	hasMeta := true
 	if err := json.Unmarshal(message, &baseMessage); err != nil {
-		return createErrorResponse(
-			nil,
-			mcp.PARSE_ERROR,
-			"Failed to parse message",
-		)
+		hasMeta = false
+		baseMessage.envelope = envelope{}
+		baseMessage.Params.Meta = nil
+		if err := json.Unmarshal(message, &baseMessage.envelope); err != nil {
+			return createErrorResponse(
+				nil,
+				mcp.PARSE_ERROR,
+				"Failed to parse message",
+			)
+		}
 	}
 
 	if len(baseMessage.RawID) > 0 {
@@ -109,7 +121,11 @@ func (s *MCPServer) HandleMessage(
 	// 2026-07-28 removed the initialize handshake: a modern request carries
 	// its protocol version, client identity, and client capabilities in _meta
 	// (SEP-2575). Anything else is served through the legacy path.
-	protocolInfo, protocolErr := extractRequestProtocolInfo(message)
+	protocolInfo := &RequestProtocolInfo{}
+	var protocolErr error
+	if hasMeta {
+		protocolInfo, protocolErr = protocolInfoFromMeta(baseMessage.Params.Meta)
+	}
 	if protocolErr != nil {
 		return errorResponseForProtocolError(baseMessage.ID, protocolErr)
 	}
@@ -147,15 +163,8 @@ func (s *MCPServer) HandleMessage(
 
 	// Extract trace context from _meta before opening the server span so the span
 	// inherits the correct parent (SEP-414, transport-agnostic propagation).
-	{
-		var metaWrapper struct {
-			Params struct {
-				Meta *mcp.Meta `json:"_meta"`
-			} `json:"params"`
-		}
-		if json.Unmarshal(message, &metaWrapper) == nil {
-			ctx = s.extractMeta(ctx, metaWrapper.Params.Meta)
-		}
+	if hasMeta {
+		ctx = s.extractMeta(ctx, baseMessage.Params.Meta)
 	}
 
 	ctx, endSpan := s.startMessageSpan(ctx, headers, string(baseMessage.Method))
