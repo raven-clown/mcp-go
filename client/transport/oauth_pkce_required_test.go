@@ -116,6 +116,7 @@ func TestAuthorizationFlow_PKCESendsChallengeAndVerifier(t *testing.T) {
 	require.NoError(t, err)
 	parsed, err := url.Parse(authURL)
 	require.NoError(t, err)
+	assert.Equal(t, GenerateCodeChallenge(verifier), parsed.Query().Get("code_challenge"))
 	assert.Equal(t, "S256", parsed.Query().Get("code_challenge_method"))
 
 	require.NoError(t, h.ProcessAuthorizationResponse(t.Context(), "CODE", "st", verifier))
