@@ -112,6 +112,17 @@ func WithStreamableHTTPHost(host string) StreamableHTTPCOption {
 	}
 }
 
+// WithHTTPMaxMessageBytes bounds the size of a message the client reads from
+// the server: a JSON response body, or the data of one SSE event. A request
+// whose response is larger fails with ErrMessageTooLarge, and so does a
+// larger event on the GET stream, which then ends. The default is
+// DefaultMaxMessageBytes; zero or less removes the bound.
+func WithHTTPMaxMessageBytes(n int64) StreamableHTTPCOption {
+	return func(sc *StreamableHTTP) {
+		sc.maxMessageBytes = n
+	}
+}
+
 // StreamableHTTP implements Streamable HTTP transport.
 //
 // It transmits JSON-RPC messages over individual HTTP requests. One message per request.
@@ -134,6 +145,7 @@ type StreamableHTTP struct {
 	host                string
 	logger              *slog.Logger
 	getListeningEnabled bool
+	maxMessageBytes     int64
 
 	sessionID       atomic.Value // string
 	protocolVersion atomic.Value // string
@@ -184,6 +196,8 @@ func NewStreamableHTTP(serverURL string, options ...StreamableHTTPCOption) (*Str
 		closed:      make(chan struct{}),
 		logger:      slog.Default(),
 		initialized: make(chan struct{}),
+
+		maxMessageBytes: DefaultMaxMessageBytes,
 	}
 	smc.sessionID.Store("") // set initial value to simplify later usage
 
@@ -738,7 +752,7 @@ func (c *StreamableHTTP) SendRequest(
 
 		// handle error response
 		var errResponse JSONRPCResponse
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp.Body)
 		if isJSONRPCErrorBody(body) {
 			if err := json.Unmarshal(body, &errResponse); err == nil && errResponse.Error != nil {
 				return &errResponse, nil
@@ -767,7 +781,7 @@ func (c *StreamableHTTP) SendRequest(
 	case "application/json":
 		// Single response
 		var response JSONRPCResponse
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		if err := json.NewDecoder(newBoundedReader(resp.Body, c.maxMessageBytes)).Decode(&response); err != nil {
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
@@ -909,12 +923,16 @@ func (c *StreamableHTTP) sendHTTP(
 
 	// universal handling for session terminated
 	if resp.StatusCode == http.StatusNotFound {
-		resp.Body.Close()
-		// A 404 for the GET stream may only mean that the server doesn't
-		// offer it, so listenForever decides.
-		if method != http.MethodGet {
-			c.endSession(sentSession)
+		// A 404 on the GET stream may only mean the server doesn't offer it,
+		// so the caller decides. Hand the body back: Close can block until
+		// the request context is canceled, and the caller cancels first.
+		// POST still closes here, then ends the session, before the caller
+		// sees the error.
+		if method == http.MethodGet {
+			return resp, ErrSessionTerminated
 		}
+		resp.Body.Close()
+		c.endSession(sentSession)
 		return nil, ErrSessionTerminated
 	}
 
@@ -931,9 +949,10 @@ func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCl
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// resumeErr is why the stream couldn't be resumed. It is written before
-	// responseChan is closed and read after, so the close orders the two.
-	var resumeErr error
+	// resumeErr is why the stream couldn't be resumed, and readErr why it
+	// broke off. They are written before responseChan is closed and read
+	// after, so the close orders the two.
+	var resumeErr, readErr error
 
 	// Start a goroutine to process the SSE stream
 	go func() {
@@ -1000,6 +1019,7 @@ func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCl
 				return
 			}
 		}
+		readErr = cursor.err
 	}()
 
 	// Wait for the response or context cancellation
@@ -1008,6 +1028,9 @@ func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCl
 		if response == nil {
 			if resumeErr != nil {
 				return nil, fmt.Errorf("failed to resume the SSE stream for the response: %w", resumeErr)
+			}
+			if readErr != nil {
+				return nil, fmt.Errorf("failed to read the SSE stream for the response: %w", readErr)
 			}
 			return nil, fmt.Errorf("unexpected nil response")
 		}
@@ -1052,6 +1075,10 @@ func (c *StreamableHTTP) resumeSSE(ctx context.Context, cursor *sseCursor, handl
 	resp, err := c.sendHTTP(ctx, http.MethodGet, nil, "text/event-stream", header, false)
 	if err != nil {
 		cancel()
+		// A GET 404 comes back with the body still open.
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		return false, err
 	}
 	// Cancel before closing the body, as SendRequest does.
@@ -1082,6 +1109,8 @@ type sseCursor struct {
 	lastEventID string
 	retry       time.Duration
 	hasRetry    bool
+	// err is why the stream last broke off, if it did.
+	err error
 }
 
 // readSSEWithCursor is readSSE that also records the id and retry fields
@@ -1114,7 +1143,7 @@ func (c *StreamableHTTP) readSSEWithCursor(ctx context.Context, reader io.ReadCl
 	}
 
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readSSELine(br, c.maxMessageBytes)
 		if err != nil {
 			// Context was cancelled — reader was closed by the goroutine above.
 			if ctx.Err() != nil {
@@ -1133,6 +1162,9 @@ func (c *StreamableHTTP) readSSEWithCursor(ctx context.Context, reader io.ReadCl
 				return true
 			}
 			c.logger.Error("SSE stream error", "err", err)
+			if cursor != nil {
+				cursor.err = err
+			}
 			return false
 		}
 
@@ -1158,6 +1190,13 @@ func (c *StreamableHTTP) readSSEWithCursor(ctx context.Context, reader io.ReadCl
 			event = strings.TrimSpace(eventStr)
 		} else if dataStr, ok := strings.CutPrefix(line, "data:"); ok {
 			data = appendSSEData(data, dataStr)
+			if c.maxMessageBytes > 0 && int64(len(data)) > c.maxMessageBytes {
+				c.logger.Error("SSE stream error", "err", ErrMessageTooLarge)
+				if cursor != nil {
+					cursor.err = ErrMessageTooLarge
+				}
+				return false
+			}
 		} else if idStr, ok := strings.CutPrefix(line, "id:"); ok {
 			// The SSE spec ignores an id that contains a NUL character.
 			if value := strings.TrimPrefix(idStr, " "); !strings.ContainsRune(value, 0) {
@@ -1221,7 +1260,7 @@ func (c *StreamableHTTP) SendNotification(ctx context.Context, notification mcp.
 			ResourceMetadataURL: metadataURL,
 		}
 	default:
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp.Body)
 		return fmt.Errorf(
 			"notification failed with status %d: %s",
 			resp.StatusCode,
@@ -1344,13 +1383,20 @@ var (
 // createGETConnectionToServer opens the GET stream and reads it until it
 // ends. opened reports whether the server accepted the stream.
 func (c *StreamableHTTP) createGETConnectionToServer(ctx context.Context) (opened bool, err error) {
+	ctx, cancel := c.contextAwareOfClientClose(ctx)
+
 	resp, err := c.sendHTTP(ctx, http.MethodGet, nil, "text/event-stream", nil, false)
 	if err != nil {
+		cancel()
+		// A GET 404 comes back with the body still open.
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		return false, fmt.Errorf("failed to send request: %w", err)
 	}
 	// Cancel the context before closing the body to prevent HTTP/2 drain hangs,
 	// matching the pattern used in SendRequest and SendNotification.
-	defer func() { resp.Body.Close() }()
+	defer func() { cancel(); resp.Body.Close() }()
 
 	// Check if we got an error response
 	if resp.StatusCode == http.StatusMethodNotAllowed {
@@ -1358,7 +1404,7 @@ func (c *StreamableHTTP) createGETConnectionToServer(ctx context.Context) (opene
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp.Body)
 		return false, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, body)
 	}
 
@@ -1492,7 +1538,7 @@ func (c *StreamableHTTP) sendResponseToServer(ctx context.Context, response *JSO
 	defer func() { cancel(); resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp.Body)
 		c.logger.Error("server rejected response", "status", resp.StatusCode, "body_len", len(body))
 	}
 }
