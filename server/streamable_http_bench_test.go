@@ -21,7 +21,7 @@ func modernCallMsg(method string, size int) []byte {
 	if params != "" {
 		sep = ","
 	}
-	return []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":{%s%s"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`, method, params, sep))
+	return fmt.Appendf(nil, `{"jsonrpc":"2.0","id":1,"method":%q,"params":{%s%s"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`, method, params, sep)
 }
 
 func BenchmarkStreamableHTTPModern(b *testing.B) {
